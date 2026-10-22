@@ -228,21 +228,27 @@ async function executeRemoteTool(
   }
   if (name === STRUCTURED_OUTPUT_TOOL && runtime.outputContract) {
     const inspected = inspectStructuredSubmission(runtime.outputContract, args.output);
-    runtime.structuredSubmission = inspected.submission;
+    // 接受即终局（sticky）。此前每次调用无条件覆写 runtime.structuredSubmission——
+    // 模型在接受后又重发字符串化/截断版本时，被拒调用把已接受的权威产物清成 null，
+    // 回合结束即 structured_output_submission_missing（实测复现：step 8 对象提交已
+    // 接受，step 18+ 重发坏串，91 步耗尽）。
+    if (inspected.submission) runtime.structuredSubmission = inspected.submission;
     const outputText = inspected.submission ? ['Structured output accepted. End this workflow action without rewriting the artifact.',
       ...(inspected.observations.length ? [JSON.stringify({ observations: inspected.observations })] : [])].join('\n')
       : JSON.stringify({ code: 'structured_output_contract_invalid', issues: inspected.issues, observations: inspected.observations,
         requiredAction: 'Repair these structural issues and resubmit output in this same turn.' });
     appendExecution(runtime, { name, args, startedAt, startedAtMs, status: inspected.submission ? 'succeeded' : 'failed', outputText });
-    return { content: [{ type: 'text', text: outputText }], ...(inspected.submission ? {} : { isError: true }) };
+    return { content: [{ type: "text", text: outputText }], ...(inspected.submission ? {} : { isError: true }) };
   }
 
   if (name === DELIVERY_EVIDENCE_TOOL.name) {
     return { content: [{ type: 'text', text: JSON.stringify({ evidence: deliveryEvidenceCatalog(runtime.executions), sourceEvidence: responseSourceEvidence(runtime.executions) }) }] };
   }
-  if (name === DELIVERY_REPORT_TOOL.name && isJsonObject(args.expectedDelivery)) {
-    const inspected = inspectArtifactDeliveryReport({ args, frozenContract: runtime.frozenContract, executions: runtime.executions });
-    runtime.artifactReportArgs = inspected.delivery ? args : null;
+  // expectedDelivery 被字符串化时先解析回对象再路由到 artifact 分支。
+  const expectedDeliveryParsed = parseJsonishArg(args.expectedDelivery);
+  if (name === DELIVERY_REPORT_TOOL.name && isJsonObject(expectedDeliveryParsed)) {
+    const inspected = inspectArtifactDeliveryReport({ args: { ...args, expectedDelivery: expectedDeliveryParsed }, frozenContract: runtime.frozenContract, executions: runtime.executions });
+    runtime.artifactReportArgs = inspected.delivery ? { ...args, expectedDelivery: expectedDeliveryParsed } : null;
     const outputText = inspected.error ?? 'Terminal artifact delivery self-check accepted against real workflow output evidence.';
     appendExecution(runtime, { name, args, startedAt, startedAtMs, status: inspected.delivery ? 'succeeded' : 'failed', outputText });
     return { content: [{ type: 'text', text: outputText }], ...(inspected.delivery ? { structuredContent: inspected.delivery } : { isError: true }) };
@@ -352,6 +358,24 @@ function requiredText(value: unknown, maxLength: number): string | null {
   return text && text.length <= maxLength ? text : null;
 }
 
+/**
+ * qwen3.8-27b 等模型提交 report_delivery 时把 delivery/requirements/
+ * expectedDelivery 序列化成 JSON 字符串（与 submit_structured_output 的字符串化问题同族），
+ * 原校验恒拒且错误信息无字段细节，模型反复重发同一坏串 → 回合 delivery_verification_missing
+ * 失败（实测复现：7 次调用全拒）。合法 JSON 串先解析回对象/数组再校验；解析失败
+ * 原样保留，交给带字段细节的诊断。
+ */
+function parseJsonishArg(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  const text = value.trim();
+  if (!text.startsWith("{") && !text.startsWith("[")) return value;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return value;
+  }
+}
+
 function executeDeliveryReport(
   runtime: McpRuntime,
   args: JsonObject,
@@ -359,14 +383,17 @@ function executeDeliveryReport(
   startedAtMs: number,
 ): JsonObject {
   runtime.deliveryReport = null;
+  const failures: string[] = [];
   const taskGoal = requiredText(args.taskGoal, 2_000);
   const requestedOutput = requiredText(args.requestedOutput, 2_000);
   const taskKind = requiredText(args.taskKind, 160);
   const rationale = requiredText(args.rationale, 1_000);
-  const delivery = isJsonObject(args.delivery) ? args.delivery : null;
+  const deliveryParsed = parseJsonishArg(args.delivery);
+  const delivery = isJsonObject(deliveryParsed) ? deliveryParsed : null;
   const deliveryKind = requiredText(delivery?.kind, 160);
   const deliveryOutput = requiredText(delivery?.output, 2_000);
-  const rawRequirements = Array.isArray(args.requirements) ? args.requirements : [];
+  const requirementsParsed = parseJsonishArg(args.requirements);
+  const rawRequirements = Array.isArray(requirementsParsed) ? requirementsParsed : [];
   const requirements: Array<{ id: string; statement: string }> = [];
   const seenIds = new Set<string>();
   for (const item of rawRequirements) {
@@ -377,20 +404,25 @@ function executeDeliveryReport(
     seenIds.add(id);
     requirements.push({ id, statement });
   }
-  if (
-    !taskGoal
-    || !requestedOutput
-    || !taskKind
-    || !rationale
-    || !delivery
-    || delivery.mode !== "response"
-    || delivery.mediaType !== null
-    || !deliveryKind
-    || !deliveryOutput
-    || requirements.length !== rawRequirements.length
-    || requirements.length === 0
-    || requirements.length > 32
-  ) {
+  if (!taskGoal) failures.push("taskGoal 缺失或超长");
+  if (!requestedOutput) failures.push("requestedOutput 缺失或超长");
+  if (!taskKind) failures.push("taskKind 缺失或超长");
+  if (!rationale) failures.push("rationale 缺失或超长");
+  if (!delivery) failures.push(`delivery 必须是 JSON 对象${typeof args.delivery === "string" ? "（当前是字符串：若非合法 JSON 请修复序列化；合法 JSON 字符串也会被接受）" : ""}`);
+  else if (delivery.mode !== "response") failures.push(`delivery.mode 必须是 "response"，当前 ${JSON.stringify(delivery.mode)}`);
+  else if (delivery.mediaType !== null) failures.push("delivery.mediaType 必须为 null");
+  if (!deliveryKind) failures.push("delivery.kind 缺失");
+  if (!deliveryOutput) failures.push("delivery.output 缺失或超长");
+  if (requirements.length !== rawRequirements.length) failures.push("requirements 中存在无法识别的条目（每项必须是含非空 id 与 statement 的对象，id 不重复）");
+  if (requirements.length === 0) failures.push("requirements 不能为空");
+  if (requirements.length > 32) failures.push(`requirements 超过 32 条上限（当前 ${requirements.length}）`);
+  if (failures.length > 0) {
+    const outputText = `report_delivery 参数不满足 response-mode 交付自检合同：${failures.join("；")}`;
+    appendExecution(runtime, { name: DELIVERY_REPORT_TOOL.name, args, startedAt, startedAtMs, status: "failed", outputText });
+    return { content: [{ type: "text", text: outputText }], isError: true };
+  }
+  // failures 已覆盖上述判空；此卫句永假，只为类型收窄（原复合条件守卫的等价物）。
+  if (!taskGoal || !requestedOutput || !taskKind || !rationale || !delivery || !deliveryKind || !deliveryOutput) {
     const outputText = "report_delivery 参数不满足 response-mode 交付自检合同";
     appendExecution(runtime, { name: DELIVERY_REPORT_TOOL.name, args, startedAt, startedAtMs, status: "failed", outputText });
     return { content: [{ type: "text", text: outputText }], isError: true };
